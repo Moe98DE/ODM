@@ -1,6 +1,7 @@
 mod download;
 mod config;
 mod state;
+pub mod core;
 
 use config::Config;
 

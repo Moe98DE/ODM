@@ -3,11 +3,14 @@ use crate::download::progress::SegmentedProgressTracker;
 use crate::download::segment::DownloadSegment;
 use crate::download::single;
 use crate::state::metadata::{DownloadMetadata, SegmentMetadata};
+use crate::core::manager::DownloadStatus;
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 
@@ -16,12 +19,18 @@ pub fn download_file_segmented(
     output_path: &str,
     num_threads: usize,
     config: &Config,
+    external_pause_flag: Option<Arc<AtomicBool>>,
+    external_status: Option<Arc<Mutex<DownloadStatus>>>,
+    external_tracker: Option<Arc<Mutex<SegmentedProgressTracker>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let meta_path = format!("{}.meta.json", output_path);
+    let url_hash = hash_url(url);
+    let meta_path = format!("downloads/meta/{}.meta.json", url_hash);
+    fs::create_dir_all("downloads/meta")?;
+
     let mut metadata: DownloadMetadata;
 
     if DownloadMetadata::exists(&meta_path) {
-        println!("🔄 Resuming download from metadata file...");
+        println!("🔄 Resuming download from metadata...");
         metadata = DownloadMetadata::load_from_file(&meta_path)?;
     } else {
         let client = Client::new();
@@ -77,13 +86,36 @@ pub fn download_file_segmented(
 
     println!("📦 Total size: {} bytes", metadata.total_size);
     println!("🧵 Threads: {}", num_threads);
-    println!("⏳ Timeout: {}s, 🔁 Retries: {}", config.timeout_secs, config.max_retries);
 
-    let tracker = Arc::new(Mutex::new(SegmentedProgressTracker::new(
-        metadata.segments.len(),
-        metadata.total_size / metadata.segments.len() as u64,
-        metadata.total_size,
-    )));
+    let pause_flag = external_pause_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let status = external_status.unwrap_or_else(|| Arc::new(Mutex::new(DownloadStatus::Idle)));
+    let tracker = external_tracker.unwrap_or_else(|| {
+        Arc::new(Mutex::new(SegmentedProgressTracker::new(
+            metadata.segments.len(),
+            metadata.total_size / metadata.segments.len() as u64,
+            metadata.total_size,
+        )))
+    });
+
+    let pause_flag_for_signal = pause_flag.clone();
+    ctrlc::set_handler(move || {
+        println!("\n🛑 Ctrl+C received. Pausing download...");
+        pause_flag_for_signal.store(true, Ordering::Relaxed);
+    }).expect("Failed to set Ctrl+C handler");
+
+    let metadata_for_saving = metadata.clone();
+    let meta_path_clone = meta_path.clone();
+    let pause_flag_for_saving = pause_flag.clone();
+    thread::spawn(move || {
+        while !pause_flag_for_saving.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(5));
+            if let Err(e) = metadata_for_saving.save_to_file(&meta_path_clone) {
+                eprintln!("⚠️ Auto-save failed: {}", e);
+            } else {
+                println!("💾 Auto-saved metadata");
+            }
+        }
+    });
 
     let mut handles = vec![];
 
@@ -92,15 +124,17 @@ pub fn download_file_segmented(
         let config_clone = config.clone();
         let url_clone = metadata.url.clone();
         let etag = metadata.etag.clone();
+        let pause_flag_clone = pause_flag.clone();
 
         let handle = thread::spawn(move || {
-            let mut segment = DownloadSegment::new(
-                url_clone.clone(),
+            let segment = DownloadSegment::new(
+                url_clone,
                 segment_meta,
                 tracker_clone,
                 &config_clone,
                 etag,
-            );            
+                pause_flag_clone,
+            );
 
             if let Err(e) = segment.download() {
                 eprintln!("❌ Segment {} failed: {}", segment.meta.segment_id, e);
@@ -114,11 +148,16 @@ pub fn download_file_segmented(
         handle.join().unwrap();
     }
 
-    merge_files(output_path, metadata.segments.len())?;
-    println!("\n✅ All segments merged to: {}", output_path);
+    if pause_flag.load(Ordering::Relaxed) {
+        println!("💾 Saving metadata on pause...");
+        metadata.save_to_file(&meta_path)?;
+        println!("⏸️ Download paused.");
+        return Ok(());
+    }
 
-    // Clean up metadata
+    merge_files(output_path, metadata.segments.len())?;
     fs::remove_file(&meta_path).ok();
+    println!("\n✅ All segments merged to: {}", output_path);
 
     Ok(())
 }
@@ -134,4 +173,11 @@ fn merge_files(output_path: &str, num_parts: usize) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn hash_url(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    hex::encode(hasher.finalize())
 }
