@@ -7,14 +7,19 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool};
 use std::thread::JoinHandle;
 
+use std::sync::atomic::Ordering;
+
 #[derive(Debug, PartialEq)]
 pub enum DownloadStatus {
     Idle,
     Downloading,
     Paused,
     Completed,
+    Canceled,
+    Retrying,
     Failed(String),
 }
+
 
 impl std::fmt::Display for DownloadStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -22,6 +27,8 @@ impl std::fmt::Display for DownloadStatus {
             DownloadStatus::Idle => write!(f, "Idle"),
             DownloadStatus::Downloading => write!(f, "Downloading"),
             DownloadStatus::Paused => write!(f, "Paused"),
+            DownloadStatus::Canceled => write!(f, "Canceled"),
+            DownloadStatus::Retrying => write!(f, "Retrying"),
             DownloadStatus::Completed => write!(f, "Completed"),
             DownloadStatus::Failed(reason) => write!(f, "Failed ({})", reason),
         }
@@ -62,11 +69,15 @@ impl DownloadManager {
 
     pub fn list_downloads(&self) -> Vec<(String, String, String)> {
         let tasks = self.tasks.lock().unwrap();
-        tasks.iter().map(|(id, task)| {
-            let status = task.status.lock().unwrap();
-            (id.clone(), task.url.clone(), status.to_string())
-        }).collect()
+        tasks
+            .iter()
+            .map(|(id, task)| {
+                let status = task.status.lock().unwrap();
+                (id.clone(), task.url.clone(), format!("{:?}", *status))
+            })
+            .collect()
     }
+    
 
     pub fn get_progress(&self, id: &str) -> Option<DownloadProgress> {
         let tasks = self.tasks.lock().unwrap();
@@ -161,4 +172,53 @@ impl DownloadManager {
             false
         }
     }
+
+    pub fn cancel(&self, id: &str) -> bool {
+        let mut tasks = self.tasks.lock().unwrap();
+        if let Some(task) = tasks.get_mut(id) {
+            println!("❌ Canceling download {}", id);
+            task.pause_flag.store(true, Ordering::Relaxed);
+    
+            // Wait for threads to exit
+            for handle in task.handles.drain(..) {
+                let _ = handle.join();
+            }
+    
+            // Clean up files
+            let _ = std::fs::remove_file(&task.meta_path);
+            for i in 0..self.config.num_threads {
+                let part_path = format!("{}.part{}", task.output_path, i);
+                let _ = std::fs::remove_file(&part_path);
+            }
+    
+            *task.status.lock().unwrap() = DownloadStatus::Canceled;
+            return true;
+        }
+        false
+    }
+
+    pub fn retry(&self, id: &str) -> bool {
+        let tasks = self.tasks.lock().unwrap();
+        if let Some(task) = tasks.get(id) {
+            let current_status = task.status.lock().unwrap();
+            match *current_status {
+                DownloadStatus::Failed(_) | DownloadStatus::Canceled => {
+                    // Allow retry
+                }
+                _ => return false, // Cannot retry if not failed or canceled
+            }
+    
+            let url = task.url.clone();
+            let output_path = task.output_path.clone();
+            drop(current_status); // Drop lock before reuse
+            drop(tasks);          // Drop entire lock to avoid deadlock
+            println!("🔁 Retrying download {}", id);
+    
+            // Reuse add_download
+            self.add_download(url, output_path);
+            return true;
+        }
+        false
+    }
+    
 }
