@@ -1,0 +1,4 @@
+timeout_secs = 10
+max_retries = 5
+num_threads = 4
+default_output_path = ""
