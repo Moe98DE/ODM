@@ -220,5 +220,28 @@ impl DownloadManager {
         }
         false
     }
+
+    pub fn remove(&self, id: &str) -> bool {
+        let mut tasks = self.tasks.lock().unwrap();
+        if let Some(mut task) = tasks.remove(id) {
+            println!("🗑️ Removing download {}", id);
+            task.pause_flag.store(true, Ordering::Relaxed);
+    
+            for handle in task.handles.drain(..) {
+                let _ = handle.join();
+            }
+    
+            // Clean up files
+            let _ = std::fs::remove_file(&task.meta_path);
+            for i in 0..self.config.num_threads {
+                let part_path = format!("{}.part{}", task.output_path, i);
+                let _ = std::fs::remove_file(&part_path);
+            }
+    
+            return true;
+        }
+        false
+    }
+    
     
 }
